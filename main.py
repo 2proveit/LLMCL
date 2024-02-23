@@ -568,18 +568,6 @@ def main():
 
         cl_trainer = PPTrainer(**train_args)
 
-    elif args.cl_method.lower() == 'kd':
-
-        from method.kd import KDTrainer
-
-        cl_trainer = KDTrainer(**train_args)
-
-    elif args.cl_method.lower() == 'hat':
-
-        from method.HAT import HATTrainer
-
-        cl_trainer = HATTrainer(**train_args)
-
     elif args.cl_method.lower() == 'ilora':
 
         from method.CLS import ILoRATrainer
