@@ -12,6 +12,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch import nn
 import torch.nn.functional as F
 
+
 # from method.BaseTrainerCL import BaseTrainerCL
 
 
@@ -99,8 +100,11 @@ class Buffer:
         max_input_id_len = max([self.input_ids[c].shape[0] for c in choice])
         max_label_len = max([self.labels[c].shape[0] for c in choice])
         # for left padding
-        input_ids = torch.stack([torch.cat([torch.zeros(max_input_id_len - ee.shape[0]).long().to(ee.device), ee]) for ee in [self.input_ids[c] for c in choice]]).reshape(size, max_input_id_len)
-        labels = torch.stack([torch.cat([torch.zeros(max_label_len - ee.shape[0]).long().to(ee.device), ee]) for ee in [self.labels[c] for c in choice]]).reshape(size, max_label_len)
+        input_ids = torch.stack(
+            [torch.cat([torch.zeros(max_input_id_len - ee.shape[0]).long().to(ee.device), ee]) for ee in
+             [self.input_ids[c] for c in choice]]).reshape(size, max_input_id_len)
+        labels = torch.stack([torch.cat([torch.zeros(max_label_len - ee.shape[0]).long().to(ee.device), ee]) for ee in
+                              [self.labels[c] for c in choice]]).reshape(size, max_label_len)
         return input_ids, labels
 
     def is_empty(self) -> bool:
@@ -134,72 +138,75 @@ class Buffer:
                 delattr(self, attr_str)
         self.num_seen_examples = 0
 
-    
+
 class ILoRAModel(LlamaForCausalLM):
-    def __init__(self, model: PeftModel, reg_decay:bool=False):
+    def __init__(self, model: PeftModel, reg_decay: bool = False):
         super().__init__(model.config)
         self.model = model
-        self.current_task_name:str = None
+        self.current_task_name = "C-STANCE"
         # regularization settings
         peft_cfg = model.peft_config['default']
         self.model.add_adapter('ema', peft_cfg)
         self.model.to(self.model.device)
-        
-        self.ema_alpha: float =0.9
-        self.alpha: float = 1
-        self.ema_update_freq: float = 0.7
+
+        self.ema_alpha: float = 0.25
+        self.reg_weight: float = 1.0
+        self.ema_update_freq: float = 0.1
         self.consistency_loss = nn.MSELoss(reduction='none')
 
-        self.buffer = Buffer(500, self.model.device)  # same as ER
-        
-        self.buffer_consist_loss = 0
-        self.ce_loss = 0
-        # weight decay
-        self.reg_decay = reg_decay
-        self.decay_rate = 0.99
-        self.fix_reg_weight = 0.1
-        
+        self.buffer = Buffer(500, 'cuda')  # same as ER
+        self.l_cons = 0
+        self.total = 0
+        self.ori_loss = 0
+
     def update_ema_weights(self, step):
         alpha = min(1 - 1 / (step + 1), self.ema_alpha)
-        
+
         self.model.set_adapter('default')
-        model_state_dict = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
-        
+        model_state_dict = {n: p.detach().clone() for n, p in self.model.named_parameters() if p.requires_grad}
+
         self.model.set_adapter('ema')
         for name, param in self.model.named_parameters():
             if name in model_state_dict.keys():
                 param.data.mul_(alpha).add_(torch.mul(model_state_dict[name].data, 1 - alpha))
-        
         self.model.set_adapter('default')
-        
+
     def update_reg_weight(self, step, decay_steps):
         if self.reg_decay:
             self.alpha = self.fix_reg_weight * self.decay_rate ** (step / decay_steps)
         else:
             self.alpha = self.fix_reg_weight
-            
+
     def update_ema_model(self, path):
         adapter_weights = load_peft_weights(path)
         set_peft_model_state_dict(self.model, adapter_weights, adapter_name='ema')
 
-    
-    def concat_inputs(self, input_ids:torch.Tensor, labels:torch.Tensor, buffer_inputs_ids:torch.Tensor, buffer_labels:torch.Tensor) -> Tuple:
+    def concat_inputs(self, input_ids: torch.Tensor, labels: torch.Tensor, buffer_inputs_ids: torch.Tensor,
+                      buffer_labels: torch.Tensor) -> Tuple:
         if buffer_inputs_ids is None or buffer_labels is None:
             return input_ids, labels
-        
+
         max_input_id_len = max(input_ids.shape[1], buffer_inputs_ids.shape[1])
         max_labels_len = max(labels.shape[1], buffer_labels.shape[1])
-        
-        extended_input_ids = torch.cat([input_ids, torch.zeros(input_ids.shape[0], max_input_id_len - input_ids.shape[1]).long().to(input_ids.device)], dim=1)
-        extended_labels = torch.cat([labels, torch.zeros(labels.shape[0], max_labels_len - labels.shape[1]).long().to(labels.device)], dim=1)
-        
-        extended_buffer_inputs_ids = torch.cat([buffer_inputs_ids, torch.zeros(buffer_inputs_ids.shape[0], max_input_id_len - buffer_inputs_ids.shape[1]).long().to(buffer_inputs_ids.device)], dim=1)
-        extended_buffer_labels = torch.cat([buffer_labels, torch.zeros(buffer_labels.shape[0], max_labels_len - buffer_labels.shape[1]).long().to(buffer_labels.device)], dim=1)        
-        
+
+        extended_input_ids = torch.cat([input_ids, torch.zeros(input_ids.shape[0],
+                                                               max_input_id_len - input_ids.shape[1]).long().to(
+            input_ids.device)], dim=1)
+        extended_labels = torch.cat(
+            [labels, torch.zeros(labels.shape[0], max_labels_len - labels.shape[1]).long().to(labels.device)], dim=1)
+
+        extended_buffer_inputs_ids = torch.cat([buffer_inputs_ids, torch.zeros(buffer_inputs_ids.shape[0],
+                                                                               max_input_id_len -
+                                                                               buffer_inputs_ids.shape[1]).long().to(
+            buffer_inputs_ids.device)], dim=1)
+        extended_buffer_labels = torch.cat([buffer_labels, torch.zeros(buffer_labels.shape[0],
+                                                                       max_labels_len - buffer_labels.shape[
+                                                                           1]).long().to(buffer_labels.device)], dim=1)
+
         input_ids = torch.cat([extended_input_ids, extended_buffer_inputs_ids], dim=0)
         labels = torch.cat([extended_labels, extended_buffer_labels], dim=0)
         return input_ids, labels
-    
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -213,45 +220,54 @@ class ILoRAModel(LlamaForCausalLM):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        buffer_inputs, buffer_labels = self.buffer.get_data(input_ids.shape[0])
-        buffer_consist_loss = 0
+        buffer_inputs, buffer_labels = None, None
+        if self.current_task_name != "C-STANCE":
+            buffer_inputs, buffer_labels = self.buffer.get_data(input_ids.shape[0])
+        l_cons = 0
         if labels is not None and buffer_inputs is not None and buffer_labels is not None:
-            buffer_inputs, buffer_labels = buffer_inputs.to(self.model.device), buffer_labels.to(self.model.device)
-                
-            self.model.set_adapter('default') # t
-            working_output = self.model(
+            self.model.set_adapter('default')
+            plastic_hiddn = self.model(
                 buffer_inputs,
                 labels=buffer_labels,
                 output_hidden_states=True,
                 return_dict=True)
-            
-            self.model.set_adapter('ema') # t-1
-            stable_output = self.model(
-                buffer_inputs,
-                labels=buffer_labels,
-                output_hidden_states=True,
-                return_dict=True)
-            buffer_consit_loss = torch.mean(self.consistency_loss(working_output.hidden_states[-1], stable_output.hidden_states[-1].detach()))
 
-            buffer_consist_loss = self.alpha * buffer_consit_loss
-            self.buffer_consist_loss = buffer_consist_loss
-            
+            self.model.set_adapter('ema')
+            with torch.no_grad():
+                stable_hiddn = self.model(
+                    buffer_inputs,
+                    labels=buffer_labels,
+                    output_hidden_states=True,
+                    return_dict=True).hidden_states
+            indexs = [inner_plastic > inner_stable for inner_plastic, inner_stable in
+                      zip(plastic_hiddn.hidden_states, stable_hiddn)]
+            reg_hiddn = [torch.where(idx, inner_plastic, inner_stable) for idx, inner_plastic, inner_stable in
+                         zip(indexs, plastic_hiddn.hidden_states, stable_hiddn)]
+
+            l_cons = torch.mean(
+                torch.cat([self.consistency_loss(plastic, ema) for plastic, ema in
+                           zip(plastic_hiddn.hidden_states, reg_hiddn)], dim=0))
+
+            self.l_cons = l_cons  # for logging use
+
         self.model.set_adapter('default')
-        input_ids, labels = self.concat_inputs(input_ids, labels, buffer_inputs, buffer_labels)
-        attention_mask = torch.zeros_like(input_ids).to(self.model.device)
-        attention_mask[input_ids != 0] = 1 
-        origin_output = self.model(
-            input_ids,
-            attention_mask=attention_mask,
+        ori_out = self.model(
+            input_ids=input_ids,
+            # attention_mask=attention_mask,
             labels=labels,
             return_dict=True,
-            output_hidden_states=True)
-        
-        self.ce_loss = origin_output.loss
+            output_hidden_states=False)
+        if labels is not None and buffer_inputs is not None and buffer_labels is not None:
+            self.total_loss = (ori_out.loss + plastic_hiddn.loss) / 2 + self.reg_weight * l_cons
+        else:
+            self.total_loss = ori_out.loss + self.reg_weight * l_cons
+        self.total = self.total_loss.item()
+
         return CausalLMOutputWithPast(
-            loss=origin_output.loss + buffer_consist_loss,
-            past_key_values=origin_output.past_key_values,
-            logits=origin_output.logits,
+            loss=self.total_loss,
+            past_key_values=ori_out.past_key_values,
+            logits=ori_out.logits,
+            hidden_states=ori_out.hidden_states
         )
 
 
@@ -262,23 +278,21 @@ class ILoRATrainer(BaseTrainerCL):
         self.add_callback(CLSCallback(self.model))
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        # add data to buffer
-        if self.current_task_name != self.task_names[0]:
-            self.model.buffer.add_data(inputs['input_ids'], inputs['labels'])
+        self.model.buffer.add_data(inputs['input_ids'], inputs['labels'])
         outputs = self.model(**inputs)
         loss = outputs.loss
+        print("loss:", loss.item())
         return (loss, outputs) if return_outputs else loss
 
     def continual_learning(self):
         resume_from_checkpoint = "False"
         for task_name, dataset in self.continual_training_dataset.items():
-            self.current_task_name = task_name
             self.model.current_task_name = task_name
-            self.update_adapter_and_train_set(resume_from_checkpoint, dataset)
+            self.current_task_name = task_name
+            self.train_dataset = dataset
             self.train()
             resume_from_checkpoint = self.save_model(task_name)
-            self.model.update_ema_model(os.path.join(self.args.output_dir, f"{self.cl_method}_{self.adapter}_checkpoint_{task_name}"))
-            
+            self.model.load_ema_model(resume_from_checkpoint)
         wandb.finish()
 
     def save_model(self, name) -> str:
@@ -292,7 +306,13 @@ class ILoRATrainer(BaseTrainerCL):
 class CLSCallback(TrainerCallback):
     def __init__(self, model: ILoRAModel):
         self.model = model
-        
+
     def on_step_end(self, args, state, control, **kwargs):
+        self.model.update_ema_weights(state.global_step)
         if wandb.run:
-            wandb.log({"buffer_consist_loss": self.model.buffer_consist_loss, "reg_weight": self.model.alpha, "ce_loss": self.model.ce_loss})
+            wandb.log({
+                "reg_weight": self.model.reg_weight,
+                "consist_loss": self.model.l_cons,
+                "total_loss": self.model.total,
+                "ori_loss": self.model.ori_loss,
+            })

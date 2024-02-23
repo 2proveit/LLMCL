@@ -570,7 +570,7 @@ def main():
 
     elif args.cl_method.lower() == 'ilora':
 
-        from method.CLS import ILoRATrainer
+        from method.ILORA import ILoRATrainer
         cl_trainer = ILoRATrainer(**train_args)
 
     elif args.cl_method.lower() == 'mtl':
